@@ -1581,17 +1581,26 @@ impl SQLContext {
                 return Ok(lf.clear());
             }
 
-            // ...otherwise parse and apply the filter as normal
-            let mut filter_expression = parse_sql_expr(expr, self, Some(schema).as_deref())?;
-            if filter_expression.clone().meta().has_multiple_outputs() {
-                filter_expression = all_horizontal([filter_expression])?;
+            // Split top-level AND conjuncts into individual filter expressions.
+            // This is critical for predicate pushdown: the optimizer assumes AND predicates
+            // are already split into separate IR::Filter nodes (see predicate_pushdown/mod.rs).
+            // Without this, a combined `(a AND b)` filter above a join cannot be pushed through,
+            // whereas two separate filters can each be independently pushed to the correct side.
+            let mut predicates = split_and_predicates(expr);
+
+            // Parse each conjunct and apply as a separate .filter() call
+            for sql_pred in predicates.iter_mut() {
+                let mut filter_expression = parse_sql_expr(sql_pred, self, Some(schema.as_ref()))?;
+                if filter_expression.clone().meta().has_multiple_outputs() {
+                    filter_expression = all_horizontal([filter_expression])?;
+                }
+                lf = self.process_subqueries(lf, vec![&mut filter_expression])?;
+                lf = if invert_filter {
+                    lf.remove(filter_expression)
+                } else {
+                    lf.filter(filter_expression)
+                };
             }
-            lf = self.process_subqueries(lf, vec![&mut filter_expression])?;
-            lf = if invert_filter {
-                lf.remove(filter_expression)
-            } else {
-                lf.filter(filter_expression)
-            };
         }
         Ok(lf)
     }
@@ -2807,4 +2816,32 @@ impl ExprSqlProjectionHeightBehavior {
             Self::InheritsContext
         }
     }
+}
+
+/// Split a SQL expression on top-level AND operators into individual conjuncts.
+///
+/// For example, `a AND b AND c` becomes `[a, b, c]`.
+/// Non-AND expressions are returned as a single-element vec.
+///
+/// This is used by `process_where` to ensure each conjunct is applied as a
+/// separate `IR::Filter` node, enabling the predicate pushdown optimizer to
+/// push each filter independently through joins and other plan nodes.
+fn split_and_predicates(expr: &SQLExpr) -> Vec<&SQLExpr> {
+    let mut predicates = Vec::new();
+    let mut stack = vec![expr];
+    while let Some(e) = stack.pop() {
+        if let SQLExpr::BinaryOp {
+            left,
+            op: SQLBinaryOperator::And,
+            right,
+        } = e
+        {
+            // push right first so left is processed first (preserves order)
+            stack.push(right);
+            stack.push(left);
+        } else {
+            predicates.push(e);
+        }
+    }
+    predicates
 }
